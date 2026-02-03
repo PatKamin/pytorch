@@ -127,6 +127,10 @@
 #     specify the version of PyTorch, rather than the hard-coded version
 #     in this file; used when we're building binaries for distribution
 #
+#   PYTORCH_BUILD_DIR
+#     CMake build directory (default: build). Use a distinct path per config,
+#     e.g. PYTORCH_BUILD_DIR=build-xpu-rwdi when switching CMAKE_BUILD_TYPE or flags.
+#
 #   TORCH_CUDA_ARCH_LIST
 #     specify which CUDA architectures to build for.
 #     ie `TORCH_CUDA_ARCH_LIST="6.0;7.0"`
@@ -1266,7 +1270,7 @@ class build_ext(setuptools.command.build_ext.build_ext):
         if cmake_cache_vars["USE_XPU"]:
             report(f"-- Detected XPU runtime at {cmake_cache_vars['SYCL_LIBRARY_DIR']}")
         else:
-            report("-- Not using XPU")
+            sys.exit(1)
         if cmake_cache_vars["USE_MKLDNN"]:
             report("-- Using MKLDNN")
             if cmake_cache_vars["USE_MKLDNN_ACL"]:
