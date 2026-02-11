@@ -3,7 +3,21 @@
 #include <ATen/xpu/XPUGraph.h>
 #include <c10/xpu/XPUFunctions.h>
 
+// Graph property enable_native_recording: see LLVM SYCL
+// sycl/ext/oneapi/experimental/detail/properties/graph_properties.def
+#include <sycl/ext/oneapi/experimental/graph.hpp>
+
 #include <cstddef>
+
+// SYCL_COMPILER_VERSION: all XPU TUs (including GCC host) via FindSYCLToolkit / add_definitions.
+// Threshold is fixed here (not CMake-configurable). Unparseable compilers may use 99999999, which
+// still satisfies >= for any realistic threshold. Bump when Intel ships native graph recording.
+#define TORCH_XPU_NATIVE_GRAPH_MIN_SYCL_COMPILER_VERSION 20260101
+#if SYCL_COMPILER_VERSION >= TORCH_XPU_NATIVE_GRAPH_MIN_SYCL_COMPILER_VERSION
+#define TORCH_XPU_SYCL_NATIVE_GRAPH_RECORDING 1
+#else
+#define TORCH_XPU_SYCL_NATIVE_GRAPH_RECORDING 0
+#endif
 
 namespace at::xpu {
 
@@ -17,7 +31,8 @@ MempoolId_t graph_pool_handle() {
 
 XPUGraphImpl::XPUGraphImpl(const GraphImplArgs& args)
     : capture_stream_(at::xpu::getCurrentXPUStream()),
-      keep_graph_(args.keep_graph) {}
+      keep_graph_(args.keep_graph),
+      native_recording_(args.native_recording) {}
 
 void XPUGraphImpl::register_generator_state(
     c10::intrusive_ptr<at::XPUGeneratorState> state) {
@@ -101,8 +116,25 @@ void XPUGraphImpl::capture_begin(
         return filter(XPUStream(XPUStream::UNCHECKED, stream));
       });
 
-  auto graph_impl = xpuGraph_t(capture_stream_.queue());
-  graph_ = std::make_unique<xpuGraph_t>(std::move(graph_impl));
+#if TORCH_XPU_SYCL_NATIVE_GRAPH_RECORDING
+  const sycl::property_list graph_props = native_recording_
+      ? sycl::property_list{property::graph::enable_native_recording{}}
+      : sycl::property_list{};
+#else
+  if (native_recording_) {
+    TORCH_WARN_ONCE(
+        "torch.xpu.XPUGraph(native_recording=True): native recording requires "
+        "SYCL_COMPILER_VERSION (from FindSYCLToolkit) >= ",
+        TORCH_XPU_NATIVE_GRAPH_MIN_SYCL_COMPILER_VERSION,
+        "; this build has ",
+        SYCL_COMPILER_VERSION,
+        ". Use a newer Intel oneAPI / SYCL toolchain (or a SYCL_ROOT whose compiler reports a "
+        "high enough version).");
+  }
+  const sycl::property_list graph_props{};
+#endif
+  graph_ = std::make_unique<xpuGraph_t>(
+      xpuGraph_t(capture_stream_.queue(), graph_props));
   graph_->begin_recording(capture_stream_.queue());
 
   TORCH_INTERNAL_ASSERT(
@@ -126,8 +158,14 @@ void XPUGraphImpl::capture_end() {
     wholegraph_increments = generator_state->capture_epilogue();
   }
 
-  size_t num_xpu_graph_nodes = graph_->get_nodes().size();
-  if (num_xpu_graph_nodes == 0) {
+  // When SYCL_COMPILER_VERSION meets the threshold, use empty(); native graphs must not use
+  // get_nodes(). Otherwise use get_nodes() for the empty check.
+#if TORCH_XPU_SYCL_NATIVE_GRAPH_RECORDING
+  const bool graph_is_empty = graph_->empty();
+#else
+  const bool graph_is_empty = (graph_->get_nodes().size() == 0);
+#endif
+  if (graph_is_empty) {
     TORCH_WARN(
         "The XPU Graph is empty. This usually means that the graph was ",
         "attempted to be captured on wrong device or stream.");
