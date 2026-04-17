@@ -10,10 +10,16 @@
 #   With --emit-itt, torch.autograd.profiler.emit_itt() marks each autograd op in the timed
 #   section; record_function(...) always adds named regions (eager, graph_replay, ...).
 #   Use --fine-grain-itt for per-iteration regions. Enable ITT in the VTune analysis properties.
+#
+# torch.profiler on XPU requires Kineto (USE_KINETO=ON when building PyTorch). USE_KINETO=OFF
+# triggers: "Legacy XPU profiling is not supported. Requires use_kineto=True on XPU devices."
 
 import argparse
 import contextlib
+import csv
+import json
 import logging
+import os
 import sys
 import time
 
@@ -21,6 +27,28 @@ import timm
 import torch
 import torch.autograd.profiler as profiler
 import torchvision.models as models
+
+
+def _profiler_activities_for_device(device: str) -> list[torch.profiler.ProfilerActivity]:
+    """Activities for torch.profiler.profile. XPU needs a Kineto-enabled build."""
+    pa = torch.profiler.ProfilerActivity
+    if device == "cuda":
+        return [pa.CPU, pa.CUDA]
+    if device == "xpu":
+        if not torch.profiler.kineto_available:
+            raise SystemExit(
+                "torch.profiler on XPU requires Kineto inside this PyTorch build.\n"
+                "You used USE_KINETO=OFF; rebuild with USE_KINETO=ON (or unset; default is ON).\n"
+                "This is not fixable with pip packages — libtorch must include Kineto."
+            )
+        supported = set(torch.profiler.supported_activities())
+        if pa.XPU not in supported:
+            raise SystemExit(
+                "ProfilerActivity.XPU is missing from torch.profiler.supported_activities(). "
+                "Use an XPU build that compiles Kineto XPU profiling support."
+            )
+        return [pa.CPU, pa.XPU]
+    raise SystemExit(f"--profiler: unsupported --device {device!r}")
 
 
 def _configure_stdout_logger(name: str) -> logging.Logger:
@@ -48,7 +76,16 @@ parser.add_argument(
     action="store_true",
     help=("Use device capture/replay graphs (CUDA or XPU)."),
 )
-parser.add_argument("--profiler", action="store_true", help="Use profiler.")
+parser.add_argument(
+    "--profiler",
+    "--profile",
+    action="store_true",
+    dest="profiler",
+    help=(
+        "Enable torch.profiler in the timed loop (exports table + real_world_app_profiler.csv). "
+        "On --device xpu, PyTorch must be built with USE_KINETO=ON."
+    ),
+)
 parser.add_argument("--logs", action="store_true", help="Log if cuda graphs are used or not.")  # alternatively set TORCH_LOGS="inductor,cuda_graphs"
 parser.add_argument("--autographs", "--autograph", action="store_true", help="Automatic use of graphs in torch.compile and with kernel fusions")
 parser.add_argument("--compile", action="store_true", help="Call compile on model")
@@ -131,6 +168,13 @@ parser.add_argument(
     action="store_true",
     help="Wrap timed loops with profiler.emit_itt() (dense per-op ITT for VTune). Default: off.",
 )
+parser.add_argument(
+    "--output-json",
+    type=str,
+    default=None,
+    metavar="PATH",
+    help="If set, write latency (and basic run metadata) to this JSON file in addition to the log line.",
+)
 args = parser.parse_args()
 
 batch_size = args.batch if args.batch is not None else args.iter
@@ -152,6 +196,10 @@ if args.graphs and args.device == "cuda" and args.model == "retina":
     logger.warning(
         "RetinaNet eval postprocess_detections (NMS, masking, etc.) uses ops CUDA graph capture does not allow"
     )
+
+_profiler_activities: list[torch.profiler.ProfilerActivity] | None = None
+if args.profiler:
+    _profiler_activities = _profiler_activities_for_device(args.device)
 
 def _itt_ctx():
     return profiler.emit_itt() if args.emit_itt else contextlib.nullcontext()
@@ -491,7 +539,107 @@ else:
     is_list_input = False
 
 schedule = torch.profiler.schedule(
-    wait=10, warmup=20, active=60, repeat=1)
+    wait=20, warmup=30, active=1000, repeat=1)
+
+prof = None
+
+
+def _write_profiler_key_averages_csv(profile, csv_path: str) -> None:
+    """Export profiler.key_averages() to CSV (same ordering as table(sort_by=self_cuda_time_total))."""
+    from torch.autograd.profiler import DeviceType
+
+    events = list(profile.key_averages())
+    if not events:
+        logger.warning("Profiler key_averages empty; skip CSV %s", csv_path)
+        return
+
+    events.sort(key=lambda e: e.self_device_time_total, reverse=True)
+
+    sum_self_cpu_time_total = 0
+    sum_self_device_time_total = 0
+    for evt in events:
+        sum_self_cpu_time_total += evt.self_cpu_time_total
+        if evt.device_type == DeviceType.CPU and evt.is_legacy:
+            sum_self_device_time_total += evt.self_device_time_total
+        elif (
+            evt.device_type
+            in (
+                DeviceType.CUDA,
+                DeviceType.PrivateUse1,
+                DeviceType.MTIA,
+                DeviceType.XPU,
+            )
+            and not getattr(evt, "is_user_annotation", False)
+        ):
+            sum_self_device_time_total += evt.self_device_time_total
+
+    def _pct(numerator: int, denom: int) -> float:
+        if denom == 0:
+            return 0.0 if numerator == 0 else float("nan")
+        return round(100.0 * numerator / denom, 2)
+
+    use_device = (events[0].use_device or "device").upper()
+    has_device_time = any(e.self_device_time_total > 0 for e in events)
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if has_device_time:
+            writer.writerow(
+                [
+                    "Name",
+                    "Self CPU %",
+                    "Self CPU (us)",
+                    "CPU total %",
+                    "CPU total (us)",
+                    "CPU time avg (us)",
+                    f"Self {use_device} (us)",
+                    f"Self {use_device} %",
+                    f"{use_device} total (us)",
+                    f"{use_device} time avg (us)",
+                    "# of Calls",
+                ]
+            )
+        else:
+            writer.writerow(
+                [
+                    "Name",
+                    "Self CPU %",
+                    "Self CPU (us)",
+                    "CPU total %",
+                    "CPU total (us)",
+                    "CPU time avg (us)",
+                    "# of Calls",
+                ]
+            )
+
+        for evt in events:
+            cnt = evt.count if evt.count > 0 else 1
+            row = [
+                evt.key,
+                _pct(evt.self_cpu_time_total, sum_self_cpu_time_total),
+                evt.self_cpu_time_total,
+                (
+                    _pct(evt.cpu_time_total, sum_self_cpu_time_total)
+                    if not evt.is_async
+                    else 0.0
+                ),
+                evt.cpu_time_total,
+                round(evt.cpu_time_total / cnt, 3),
+            ]
+            if has_device_time:
+                row.extend(
+                    [
+                        evt.self_device_time_total,
+                        _pct(
+                            evt.self_device_time_total, sum_self_device_time_total
+                        ),
+                        evt.device_time_total,
+                        round(evt.device_time_total / cnt, 3),
+                    ]
+                )
+            row.append(evt.count)
+            writer.writerow(row)
+
 
 with torch.inference_mode():
     logger.info("warmup")
@@ -538,7 +686,11 @@ with torch.inference_mode():
         synch_name = "graph_replay_synch"
 
         if args.profiler:
-            with torch.profiler.profile(schedule=schedule, acc_events=True, activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+            with torch.profiler.profile(
+                schedule=schedule,
+                acc_events=True,
+                activities=_profiler_activities,
+            ) as prof:
                 with _itt_ctx(), profiler.record_function("graph_replay"):
                     remaining = N
                     while remaining > 0:
@@ -581,7 +733,11 @@ with torch.inference_mode():
 
         synch_name = "eager_synch"
         if args.profiler:
-            with torch.profiler.profile(schedule=schedule, acc_events=True, activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+            with torch.profiler.profile(
+                schedule=schedule,
+                acc_events=True,
+                activities=_profiler_activities,
+            ) as prof:
                 with _itt_ctx(), profiler.record_function("eager"):
                     remaining = N
                     while remaining > 0:
@@ -620,7 +776,23 @@ with torch.inference_mode():
 end_time = time.time()
 
 if args.profiler:
+    if prof is None:
+        raise RuntimeError("internal error: --profiler set but profiler context did not set prof")
     logger.info("\n%s", prof.key_averages().table(sort_by="self_cuda_time_total"))
+    _csv_path = os.path.abspath("real_world_app_profiler.csv")
+    _write_profiler_key_averages_csv(prof, _csv_path)
+    logger.info("Profiler key_averages CSV: %s", _csv_path)
 
-logger.info("Latency: %.3f msec", 1000 * (end_time - start) / N)
+latency_ms = 1000.0 * (end_time - start) / N
+logger.info("Latency: %.3f msec", latency_ms)
+
+if args.output_json:
+    out_path = os.path.abspath(args.output_json)
+    payload = {
+        "latency_ms": latency_ms,
+    }
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+    logger.info("Latency JSON: %s", out_path)
 
