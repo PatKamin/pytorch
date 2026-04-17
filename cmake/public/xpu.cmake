@@ -10,9 +10,9 @@ set(XPU_HOST_CXX_FLAGS)
 # Find SYCL library.
 find_package(SYCLToolkit REQUIRED)
 if(NOT SYCL_FOUND)
-  set(PYTORCH_FOUND_XPU FALSE)
-  # Exit early to avoid populating XPU_HOST_CXX_FLAGS.
-  return()
+  message(FATAL_ERROR
+    "SYCL toolkit is required but was not found. "
+    "Please install Intel oneAPI and set SYCL_ROOT or CMPLR_ROOT.")
 endif()
 set(PYTORCH_FOUND_XPU TRUE)
 
