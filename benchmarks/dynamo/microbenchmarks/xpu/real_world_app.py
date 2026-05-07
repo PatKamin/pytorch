@@ -113,6 +113,7 @@ parser.add_argument(
         "sd15",
         "tinyllama",
         "whisper_enc",
+        "framepack_i2v",
     ],
     default="resnet",
     help=(
@@ -120,7 +121,8 @@ parser.add_argument(
         "tinyllama = TinyLlama 1.1B one forward, last-token logits, BS=1 (needs transformers) — "
         "typical manual-graph target for decode-style loops (Phi/TinyLlama/Llama-small family). "
         "whisper_enc = Whisper encoder on fixed-shape log-mel (needs transformers) — audio/STT-style "
-        "static compute for fixed window sizes."
+        "static compute for fixed window sizes. "
+        "framepack_i2v = FramePack I2V-HY one transformer denoising step (needs diffusers)."
     ),
 )
 parser.add_argument("--retina-size", type=int, default=224, help="retina input size")
@@ -340,6 +342,84 @@ class _CausalLMOneDecodeForward(torch.nn.Module):
         return out.logits[:, -1, :].float()
 
 
+class _FramePackI2VOneDenoiseStep(torch.nn.Module):
+    """Single FramePack I2V-HY transformer forward for one next-frame-section prediction step.
+
+    FramePack is a next-frame-prediction video diffusion model that compresses all previously
+    generated frame context into a constant-length packed representation, making the per-step
+    workload invariant to video length.  One forward corresponds to predicting one latent window
+    (default: 9 latent frames) given fixed-shape packed history at three temporal scales (1x/2x/4x).
+
+    All conditioning and context tensors are registered as buffers so graph capture sees no
+    host-side allocations inside forward.  Shapes follow the pipeline defaults:
+      latent_window_size=9, history_sizes=[16, 2, 1], lat_h=lat_w=8.
+    """
+
+    # FramePack VANILLA sampling layout constants (pipeline defaults).
+    _LATENT_WINDOW = 9
+    _HISTORY_1X = 16
+    _HISTORY_2X = 2
+    _HISTORY_4X = 1
+    # Number of ViT patch tokens from the SigLIP image encoder (224px / 14px patch + CLS).
+    _IMAGE_EMBED_TOKENS = 257
+
+    def __init__(self, transformer: torch.nn.Module) -> None:
+        super().__init__()
+        self.transformer = transformer
+        cfg = transformer.config
+        dev = next(transformer.parameters()).device
+        dtype = next(transformer.parameters()).dtype
+
+        C = cfg.in_channels               # 16
+        text_dim = cfg.text_embed_dim     # 4096
+        pooled_dim = cfg.pooled_projection_dim  # 768
+        image_dim = cfg.image_proj_dim    # 1152
+
+        W = self._LATENT_WINDOW
+        h1x, h2x, h4x = self._HISTORY_1X, self._HISTORY_2X, self._HISTORY_4X
+        lat_h = lat_w = 8  # small spatial latent for benchmarking
+
+        # Positional index tensors (VANILLA layout): arange split into per-chunk slices.
+        # Total sequence length: prefix(1) + history_4x + history_2x + history_1x + window
+        indices = torch.arange(1 + h4x + h2x + h1x + W)
+        idx_prefix, idx_h4x, idx_h2x, idx_h1x, idx_window = indices.split([1, h4x, h2x, h1x, W])
+        idx_clean = torch.cat([idx_prefix, idx_h1x])  # prefix + 1x history
+
+        self.register_buffer("timestep", torch.tensor([500], device=dev, dtype=torch.long))
+        self.register_buffer("encoder_hidden_states", torch.randn(1, 256, text_dim, device=dev, dtype=dtype))
+        self.register_buffer("encoder_attention_mask", torch.ones(1, 256, device=dev, dtype=torch.bool))
+        self.register_buffer("pooled_projections", torch.randn(1, pooled_dim, device=dev, dtype=dtype))
+        self.register_buffer("image_embeds", torch.randn(1, self._IMAGE_EMBED_TOKENS, image_dim, device=dev, dtype=dtype))
+        self.register_buffer("guidance", torch.tensor([3500.0], device=dev, dtype=dtype))  # guidance_scale=3.5 * 1000
+        self.register_buffer("latents_clean", torch.zeros(1, C, 1 + h1x, lat_h, lat_w, device=dev, dtype=dtype))
+        self.register_buffer("latents_history_2x", torch.zeros(1, C, h2x, lat_h, lat_w, device=dev, dtype=dtype))
+        self.register_buffer("latents_history_4x", torch.zeros(1, C, h4x, lat_h, lat_w, device=dev, dtype=dtype))
+        self.register_buffer("indices_latents", idx_window.to(dev))
+        self.register_buffer("indices_latents_clean", idx_clean.to(dev))
+        self.register_buffer("indices_latents_history_2x", idx_h2x.to(dev))
+        self.register_buffer("indices_latents_history_4x", idx_h4x.to(dev))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        out = self.transformer(
+            hidden_states=hidden_states,
+            timestep=self.timestep,
+            encoder_hidden_states=self.encoder_hidden_states,
+            encoder_attention_mask=self.encoder_attention_mask,
+            pooled_projections=self.pooled_projections,
+            image_embeds=self.image_embeds,
+            indices_latents=self.indices_latents,
+            guidance=self.guidance,
+            latents_clean=self.latents_clean,
+            indices_latents_clean=self.indices_latents_clean,
+            latents_history_2x=self.latents_history_2x,
+            indices_latents_history_2x=self.indices_latents_history_2x,
+            latents_history_4x=self.latents_history_4x,
+            indices_latents_history_4x=self.indices_latents_history_4x,
+            return_dict=False,
+        )
+        return out[0]
+
+
 def _load_tinyllama_decode_benchmark(device: str, dtype: torch.dtype) -> torch.nn.Module:
     try:
         from transformers import AutoModelForCausalLM
@@ -399,6 +479,26 @@ def _load_sd15_unet_benchmark(device: str, dtype: torch.dtype) -> torch.nn.Modul
     )
     unet = unet.to(dev).eval()
     return _StableDiffusion15UNetDenoiseStep(unet, dev, dtype)
+
+
+def _load_framepack_i2v_benchmark(device: str) -> torch.nn.Module:
+    try:
+        from diffusers import HunyuanVideoFramepackTransformer3DModel
+    except ImportError as e:
+        raise SystemExit(
+            "--model framepack_i2v requires the `diffusers` package. Install with: pip install diffusers"
+        ) from e
+
+    model_id = "lllyasviel/FramePackI2V_HY"
+    dev = torch.device(device)
+    logger.info(f"load {model_id} (one next-frame-section denoising step)...")
+    transformer = HunyuanVideoFramepackTransformer3DModel.from_pretrained(
+        model_id,
+        torch_dtype=torch.bfloat16,
+        device_map=device,
+    )
+    transformer = transformer.eval()
+    return _FramePackI2VOneDenoiseStep(transformer)
 
 
 torch.set_float32_matmul_precision('high')
@@ -481,6 +581,8 @@ elif args.model == "whisper_enc":
             whisper_mel_frames,
             args.mel_frames,
         )
+elif args.model == "framepack_i2v":
+    model = _load_framepack_i2v_benchmark(args.device)
 else:
     raise RuntimeError(f"unknown model {args.model}")
 
@@ -532,6 +634,19 @@ elif args.model == "whisper_enc":
         whisper_mel_frames,
         device=args.device,
         dtype=torch.float32,
+    )
+    is_list_input = False
+elif args.model == "framepack_i2v":
+    # Noisy latents for one latent window: (B, C, T, H_lat, W_lat).
+    # C=in_channels=16, T=latent_window_size=9, lat_h=lat_w=8 match the wrapper buffers.
+    x = torch.randn(
+        1,
+        model.transformer.config.in_channels,
+        _FramePackI2VOneDenoiseStep._LATENT_WINDOW,
+        8,
+        8,
+        device=args.device,
+        dtype=torch.bfloat16,
     )
     is_list_input = False
 else:
