@@ -1158,7 +1158,7 @@ if(USE_XPU)
 
   # ATen XPU implementation
   set(TORCH_XPU_OPS_DIR ${TORCH_ROOT}/third_party/torch-xpu-ops)
-  set(TORCH_XPU_OPS_REPO_URL https://github.com/lslusarczyk/torch-xpu-ops)
+  set(TORCH_XPU_OPS_REPO_URL https://github.com/PatKamin/torch-xpu-ops)
   file(READ "${TORCH_ROOT}/third_party/xpu.txt" TORCH_XPU_OPS_COMMIT)
   string(REGEX REPLACE "\n$" "" TORCH_XPU_OPS_COMMIT "${TORCH_XPU_OPS_COMMIT}")
   if(NOT EXISTS "${TORCH_XPU_OPS_DIR}/.git")
